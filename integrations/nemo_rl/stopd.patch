@@ -1,0 +1,280 @@
+diff --git a/examples/configs/distillation_math_stopd.yaml b/examples/configs/distillation_math_stopd.yaml
+new file mode 100644
+index 000000000..c6f71eb5a
+--- /dev/null
++++ b/examples/configs/distillation_math_stopd.yaml
+@@ -0,0 +1,31 @@
++# STOPD (https://github.com/YouAreSpecialToMe/STOPD) on top of the math distillation example.
++#   uv run examples/run_distillation.py --config examples/configs/distillation_math_stopd.yaml
++# STOPD needs: one optimizer step per rollout batch, single-turn rollouts, the synchronous vLLM engine,
++# and a context that holds the longest prompt plus max_new_tokens (the L of STOPD).
++defaults: distillation_math.yaml
++
++stopd:
++  block: 128                 # K; the largest weight is L / K
++  warmup_steps: 25           # initial Vanilla OPD steps
++  initial_denominator: null  # C of the first STOPD step when warmup_steps is 0
++  seed: 42
++
++distillation:
++  num_prompts_per_step: 128
++  num_generations_per_prompt: 1
++  max_rollout_turns: 1
++
++policy:
++  train_global_batch_size: 128     # = num_prompts_per_step * num_generations_per_prompt
++  max_total_sequence_length: 9216  # longest prompt (1024) + L (8192)
++  generation:
++    max_new_tokens: 8192           # L
++    vllm_cfg:
++      async_engine: false
++      max_model_len: 9216
++
++teacher:
++  max_total_sequence_length: 9216
++
++data:
++  max_input_seq_length: 1024
+diff --git a/nemo_rl/algorithms/distillation.py b/nemo_rl/algorithms/distillation.py
+index 4fca89808..80cbbfc88 100644
+--- a/nemo_rl/algorithms/distillation.py
++++ b/nemo_rl/algorithms/distillation.py
+@@ -647,6 +647,14 @@ def setup(
+         ray.get(futures_train + futures_inference)
+ 
+     loss_fn = DistillationLossFn(loss_config)
++    stopd_config = getattr(master_config, "stopd", None)
++    if stopd_config:
++        # STOPD: random per-rollout token budgets with inverse-probability weights (nemo_rl/algorithms/stopd.py)
++        from nemo_rl.algorithms.stopd import STOPDDistillationLossFn
++
++        loss_fn = STOPDDistillationLossFn(
++            loss_config, stopd_config, master_config, loaded_state
++        )
+ 
+     print("\n" + "=" * 60)
+     print(" " * 18 + "SETUP COMPLETE")
+@@ -798,6 +806,10 @@ def _distillation_train_impl(
+                             master_config.distillation.num_generations_per_prompt
+                         )
+                     )
++                    if hasattr(loss_fn, "budgets"):  # STOPD
++                        repeated_batch["max_new_tokens"] = loss_fn.budgets(
++                            repeated_batch.size
++                        )
+ 
+                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
+                 print(
+@@ -960,6 +972,8 @@ def _distillation_train_impl(
+                         **{"rl.iteration": total_steps + 1},
+                     ),
+                 ):
++                    if hasattr(loss_fn, "begin_step"):  # STOPD
++                        loss_fn.begin_step(total_steps)
+                     train_results = student_policy.train(
+                         train_data,
+                         loss_fn,
+@@ -1006,6 +1020,8 @@ def _distillation_train_impl(
+                     "total_num_tokens": input_lengths.numpy(),
+                 }
+                 metrics.update(train_results["all_mb_metrics"])
++                if hasattr(loss_fn, "end_step"):  # STOPD: next step's denominator
++                    metrics.update(loss_fn.end_step(train_data))
+                 for k, v in metrics.items():
+                     if k in {
+                         "lr",
+@@ -1051,6 +1067,8 @@ def _distillation_train_impl(
+                     elif hasattr(distillation_save_state, "val_reward"):
+                         delattr(distillation_save_state, "val_reward")
+                     distillation_save_state.consumed_samples = consumed_samples
++                    if hasattr(loss_fn, "state_dict"):  # STOPD
++                        distillation_save_state.stopd = loss_fn.state_dict()
+ 
+                     full_metric_name = master_config.checkpointing["metric_name"]
+                     if full_metric_name is not None:
+diff --git a/nemo_rl/algorithms/stopd.py b/nemo_rl/algorithms/stopd.py
+new file mode 100644
+index 000000000..394e34287
+--- /dev/null
++++ b/nemo_rl/algorithms/stopd.py
+@@ -0,0 +1,140 @@
++# Copyright 2026 the STOPD authors. Licensed under the Apache License, Version 2.0.
++"""STOPD (Stochastic Truncated On-Policy Distillation) for on-policy distillation.
++
++https://github.com/YouAreSpecialToMe/STOPD
++
++Enabled by a top-level ``stopd`` block in the distillation config::
++
++    stopd:
++      block: 128                  # K; the largest weight is L / K
++      warmup_steps: 25            # initial Vanilla OPD steps
++      initial_denominator: null   # C of the first STOPD step when warmup_steps is 0
++      seed: 42
++
++L is ``policy.generation.max_new_tokens``. Before generation, every training
++rollout gets its own max_new_tokens: the end of a uniformly drawn token's block.
++The loss is NeMo-RL's own distillation loss, with each token multiplied by its
++inverse keep probability and the sum divided by C_k, which is fixed before step
++k (the last warmup step's token count, then the previous step's IPW-weighted
++token count), instead of the batch's valid-token count.
++
++The training driver keeps the schedule and needs the ``stopd`` package
++(``pip install git+https://github.com/YouAreSpecialToMe/STOPD``). The policy
++workers only unpickle the loss below, which depends on torch and nemo_rl alone.
++"""
++
++from typing import Any, Optional
++
++import torch
++
++from nemo_rl.algorithms.loss.loss_functions import DistillationLossFn
++
++
++def ipw_weights(token_mask: torch.Tensor, max_len: int, block: int) -> torch.Tensor:
++    """1 / p_t at the response tokens of a [B, S] mask (0 elsewhere), t counted from each response's start."""
++    mask = token_mask.bool()
++    pos = (mask.long().cumsum(-1) - 1).clamp_min(0)
++    weights = max_len / (max_len - (pos // block) * block).to(torch.float32)
++    return weights * mask
++
++
++class STOPDDistillationLossFn(DistillationLossFn):
++    """NeMo-RL's distillation loss with STOPD's weights and denominator, plus the driver-side schedule."""
++
++    def __init__(
++        self,
++        cfg: Any,
++        stopd_cfg: dict[str, Any],
++        master_config: Any,
++        loaded_state: Optional[dict[str, Any]] = None,
++    ):
++        super().__init__(cfg)
++        from stopd import STOPD  # driver only
++
++        generation = master_config.policy["generation"]
++        distillation = master_config.distillation
++        self.max_len = int(generation["max_new_tokens"])
++        self.block = int(stopd_cfg.get("block", 128))
++        rollouts = distillation.num_prompts_per_step * distillation.num_generations_per_prompt
++        if master_config.policy["train_global_batch_size"] != rollouts:
++            raise ValueError(
++                "STOPD needs one optimizer step per rollout batch: set policy.train_global_batch_size to "
++                f"num_prompts_per_step * num_generations_per_prompt = {rollouts}"
++            )
++        if distillation.max_rollout_turns != 1:
++            raise ValueError("STOPD supports single-turn rollouts only (distillation.max_rollout_turns: 1)")
++        vllm_cfg = generation.get("vllm_cfg") or {}
++        if vllm_cfg.get("async_engine"):
++            raise ValueError("STOPD needs policy.generation.vllm_cfg.async_engine: false")
++        max_prompt = int(master_config.data["max_input_seq_length"])
++        if int(vllm_cfg.get("max_model_len", max_prompt + self.max_len)) < max_prompt + self.max_len:
++            raise ValueError(
++                "vllm_cfg.max_model_len must hold the longest prompt (data.max_input_seq_length) plus "
++                "max_new_tokens; a rollout cut by the context is a truncation the weights do not model"
++            )
++        self.schedule = STOPD(
++            max_len=self.max_len,
++            block=self.block,
++            warmup_steps=int(stopd_cfg.get("warmup_steps", 0)),
++            initial_denominator=stopd_cfg.get("initial_denominator"),
++            seed=stopd_cfg.get("seed", distillation.seed),
++        )
++        if loaded_state and loaded_state.get("stopd"):
++            self.schedule.load_state_dict(loaded_state["stopd"])
++        self.denominator: Optional[float] = None  # C_k of the running step; None at Vanilla warmup steps
++
++    def __getstate__(self):
++        # The loss is sent to the policy workers on every train call; they need no schedule.
++        state = dict(self.__dict__)
++        state["schedule"] = None
++        return state
++
++    # ---------------------------------------------------------------- driver, once per step
++    def budgets(self, n: int) -> torch.Tensor:
++        """max_new_tokens of the step's n training rollouts (all L during the warmup)."""
++        return torch.tensor(self.schedule.budgets(n), dtype=torch.long)
++
++    def begin_step(self, total_steps: int) -> None:
++        if self.schedule.step != total_steps:
++            raise RuntimeError(
++                f"STOPD state is at step {self.schedule.step} but training at {total_steps}; "
++                "the checkpoint was not written with STOPD"
++            )
++        self.denominator = self.schedule.denominator if self.schedule.truncating else None
++
++    def end_step(self, train_data: Any) -> dict[str, float]:
++        mask = train_data["token_mask"] * train_data["sample_mask"].unsqueeze(-1)
++        stats = self.schedule.end_step(mask, reduce=None)  # the driver holds the whole batch
++        return {
++            f"stopd/{k}": float(v)
++            for k, v in stats.items()
++            if isinstance(v, (int, float)) and not isinstance(v, bool) and k != "step"
++        }
++
++    def state_dict(self) -> dict[str, Any]:
++        return self.schedule.state_dict()
++
++    # ---------------------------------------------------------------- workers
++    def __call__(
++        self,
++        student_topk_logprobs: torch.Tensor,
++        teacher_topk_logprobs: torch.Tensor,
++        H_all: torch.Tensor | None,
++        data: Any,
++        global_valid_seqs: torch.Tensor,
++        global_valid_toks: torch.Tensor,
++    ) -> tuple[torch.Tensor, dict[str, Any]]:
++        if self.denominator is None:
++            return super().__call__(
++                student_topk_logprobs, teacher_topk_logprobs, H_all, data, global_valid_seqs, global_valid_toks
++            )
++        # The parent multiplies its per-token KL by token_mask and divides the sum by global_valid_toks.
++        token_mask = data["token_mask"]
++        weighted = dict(data)
++        weighted["token_mask"] = token_mask * ipw_weights(token_mask, self.max_len, self.block).to(
++            token_mask.device
++        )
++        denominator = torch.tensor(self.denominator, dtype=torch.float32, device=token_mask.device)
++        return super().__call__(
++            student_topk_logprobs, teacher_topk_logprobs, H_all, weighted, global_valid_seqs, denominator
++        )
+diff --git a/nemo_rl/experience/rollouts.py b/nemo_rl/experience/rollouts.py
+index c165b8bce..aee253cb4 100644
+--- a/nemo_rl/experience/rollouts.py
++++ b/nemo_rl/experience/rollouts.py
+@@ -598,6 +598,9 @@ def generate_responses(
+     else:
+         # Ensure the key exists even if it's None, matching GenerationDatumSpec
+         generation_input_data["stop_strings"] = [None] * len(input_lengths)
++    # Per-rollout max_new_tokens (set by STOPD on training batches), capped by the configured maximum
++    if "max_new_tokens" in batch:
++        generation_input_data["max_new_tokens"] = batch["max_new_tokens"]
+ 
+     # Always use synchronous generation
+     generation_outputs = policy_generation.generate(
+diff --git a/nemo_rl/models/generation/vllm/vllm_worker.py b/nemo_rl/models/generation/vllm/vllm_worker.py
+index 1a4f75e04..807aabccd 100644
+--- a/nemo_rl/models/generation/vllm/vllm_worker.py
++++ b/nemo_rl/models/generation/vllm/vllm_worker.py
+@@ -1133,14 +1133,18 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
+             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
+         )
+         cap_to_context = bool(self.cfg["vllm_cfg"].get("cap_max_tokens_to_context"))
+-        if cap_to_context or spec_lookahead > 0:
++        # Per-rollout budgets (STOPD); each is capped by the configured max_new_tokens
++        request_budgets = data.get("max_new_tokens")
++        if cap_to_context or spec_lookahead > 0 or request_budgets is not None:
+             max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
+             configured_max_new_tokens = int(self.cfg["max_new_tokens"])
+             per_request_max_new_tokens = []
+-            for input_length in input_lengths.tolist():
++            for i, input_length in enumerate(input_lengths.tolist()):
+                 per_request_max_new_tokens.append(
+                     self._request_max_new_tokens(
+-                        configured_max_new_tokens=configured_max_new_tokens,
++                        configured_max_new_tokens=configured_max_new_tokens
++                        if request_budgets is None
++                        else min(configured_max_new_tokens, int(request_budgets[i])),
+                         input_length=int(input_length),
+                         max_model_len=max_model_len,
+                         cap_to_context=cap_to_context,

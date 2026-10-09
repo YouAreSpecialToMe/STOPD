@@ -4,12 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stopd"
-version = "0.1.0"
-description = "Stochastic Truncated On-Policy Distillation (STOPD) for verl"
+version = "0.2.0"
+description = "Stochastic Truncated On-Policy Distillation (STOPD)"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
 dependencies = ["torch"]
+
+[project.optional-dependencies]
+trl = ["trl>=1.15,<1.16"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
