@@ -67,6 +67,8 @@ trainer = STOPDTrainer(model="Qwen/Qwen3-1.7B-Base", teacher_model="Qwen/Qwen3-4
 trainer.train()
 ```
 
+`examples/trl_math.py` runs it on the data of `examples/prepare_math_data.py`.
+
 `STOPDTrainer` extends TRL's on-policy `DistillationTrainer`:
 
 - **Budgets.** Each training rollout gets its own budget. With vLLM in colocate mode, each prompt gets its own SamplingParams. With transformers' `generate`, each row stops at its budget, but the batch runs until its longest row ends, so most of the saving comes from the shorter loss computation.

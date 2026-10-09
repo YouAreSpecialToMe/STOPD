@@ -59,7 +59,7 @@ The loss raises an error at setup if any of these does not hold:
 - unsupported configurations are rejected.
 
 ```bash
-NEMO_RL_SRC=/path/to/patched/RL python -m unittest tests.test_nemo_rl_integration
+NEMO_RL_SRC=/path/to/patched/RL python -m unittest discover -s tests -p test_nemo_rl_integration.py
 ```
 
 The full training loop (Ray, vLLM, GPUs) has not been run with the patch yet.

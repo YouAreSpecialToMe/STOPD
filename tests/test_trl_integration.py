@@ -68,10 +68,12 @@ class TRLIntegrationTests(unittest.TestCase):
     def make(self, max_steps, **overrides):
         from stopd.integrations.trl import STOPDConfig, STOPDTrainer
 
+        import torch
+
         kwargs = dict(output_dir=self.tmp.name, per_device_train_batch_size=4, gradient_accumulation_steps=2,
                       max_completion_length=16, stopd_block=4, stopd_warmup_steps=1, max_steps=max_steps,
                       save_steps=2, learning_rate=1e-3, beta=1.0, temperature=1.0, report_to="none",
-                      use_cpu=True, bf16=False, logging_steps=1, seed=0)
+                      use_cpu=not torch.cuda.is_available(), bf16=False, logging_steps=1, seed=0)
         kwargs.update(overrides)
         return STOPDTrainer(model=STUDENT, teacher_model=TEACHER, args=STOPDConfig(**kwargs),
                             train_dataset=self.dataset)
@@ -123,22 +125,26 @@ class TRLIntegrationTests(unittest.TestCase):
         torch.manual_seed(0)
         B, P, T = 2, 3, 5
         completion_mask = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 0, 0, 0]])
-        inputs = dict(prompt_ids=torch.randint(0, 1000, (B, P)), prompt_mask=torch.ones(B, P, dtype=torch.long),
-                      completion_ids=torch.randint(0, 1000, (B, T)), completion_mask=completion_mask)
+        device = trainer.accelerator.device
+        completion_mask = completion_mask.to(device)
+        inputs = dict(prompt_ids=torch.randint(0, 1000, (B, P), device=device),
+                      prompt_mask=torch.ones(B, P, dtype=torch.long, device=device),
+                      completion_ids=torch.randint(0, 1000, (B, T), device=device), completion_mask=completion_mask)
         student = trainer.accelerator.unwrap_model(trainer.model)
         positions = completion_mask.nonzero().tolist()
+        tol = 1e-4 if device.type == "cpu" else 1e-3   # relative; the GPU kernel sums in a different order
         per_token = []
         for i, j in positions:                                       # one-hot weights isolate each token
-            w = torch.zeros(B, T)
+            w = torch.zeros(B, T, device=device)
             w[i, j] = 1.0
             loss, _, _ = trainer._compute_loss(student, dict(inputs, stopd_weights=w), torch.tensor(1.0))
             per_token.append(loss.item())
         stock, _, _ = trainer._compute_loss(student, inputs, torch.tensor(1.0))
-        self.assertAlmostEqual(sum(per_token), stock.item(), places=4)
-        w = torch.arange(B * T, dtype=torch.float32).reshape(B, T) + 1
+        self.assertAlmostEqual(sum(per_token), stock.item(), delta=tol * max(1.0, abs(stock.item())))
+        w = torch.arange(B * T, dtype=torch.float32, device=device).reshape(B, T) + 1
         weighted, _, _ = trainer._compute_loss(student, dict(inputs, stopd_weights=w), torch.tensor(4.0))
         expected = sum(w[i, j].item() * h for (i, j), h in zip(positions, per_token)) / 4.0
-        self.assertAlmostEqual(weighted.item(), expected, places=4)
+        self.assertAlmostEqual(weighted.item(), expected, delta=tol * max(1.0, abs(expected)))
 
     def test_generation_stops_each_row_at_its_budget(self):
         from unittest import mock
