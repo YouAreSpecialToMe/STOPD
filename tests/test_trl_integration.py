@@ -1,7 +1,8 @@
-"""STOPDTrainer on real TRL with tiny models, on CPU (skipped without trl).
+"""STOPDTrainer on real TRL with tiny models (skipped without trl).
 
-TRL's divergence kernel needs Triton on a GPU, so on CPU it is replaced by a
-plain PyTorch implementation with the same interface; everything else (TRL's
+The tests run on the GPU when exactly one is visible, with TRL's own Triton
+divergence kernel. Otherwise they run on CPU, where that kernel is replaced by
+a plain PyTorch implementation with the same interface; everything else (TRL's
 generation, batching, loss reduction and checkpointing) is TRL's own code.
 """
 
@@ -22,13 +23,15 @@ TEACHER = "trl-internal-testing/small-Qwen3ForCausalLM"
 
 
 def install_reference_kernel():
-    """Use TRL's kernel when it imports (GPU with Triton), else a reference one (reverse KL, beta = 1)."""
-    try:
-        import trl.kernels.chunked_divergence  # noqa: F401
-        return
-    except Exception:
-        pass
+    """Use TRL's kernel on a single visible GPU (it needs Triton), else a reference one (reverse KL, beta = 1)."""
     import torch
+
+    if torch.cuda.device_count() == 1:
+        try:
+            import trl.kernels.chunked_divergence  # noqa: F401
+            return
+        except Exception:
+            pass
 
     class ChunkedDivergenceFunction:
         @staticmethod
@@ -70,10 +73,11 @@ class TRLIntegrationTests(unittest.TestCase):
 
         import torch
 
+        # A single process: TRL refuses nn.DataParallel, so the tests use a GPU only when exactly one is visible.
         kwargs = dict(output_dir=self.tmp.name, per_device_train_batch_size=4, gradient_accumulation_steps=2,
                       max_completion_length=16, stopd_block=4, stopd_warmup_steps=1, max_steps=max_steps,
                       save_steps=2, learning_rate=1e-3, beta=1.0, temperature=1.0, report_to="none",
-                      use_cpu=not torch.cuda.is_available(), bf16=False, logging_steps=1, seed=0)
+                      use_cpu=torch.cuda.device_count() != 1, bf16=False, logging_steps=1, seed=0)
         kwargs.update(overrides)
         return STOPDTrainer(model=STUDENT, teacher_model=TEACHER, args=STOPDConfig(**kwargs),
                             train_dataset=self.dataset)

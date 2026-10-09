@@ -24,9 +24,9 @@ STOPD keeps the distillation loss itself unchanged, so any per-token loss works,
 | Framework | How to use it | Tested |
 | --- | --- | --- |
 | Any training loop | `stopd.STOPD`, PyTorch only ([below](#any-training-loop)) | CPU unit tests |
-| [verl](https://github.com/verl-project/verl) | Import hooks, no change to verl ([below](#verl)) | Same code path as the paper's experiments. Hooks tested on CPU with stand-in classes. |
-| [TRL](https://github.com/huggingface/trl) | `stopd.integrations.trl.STOPDTrainer` ([below](#trl)) | Real TRL 1.15.0 on CPU with tiny models. vLLM colocate is not yet tested. |
-| [NeMo-RL](https://github.com/NVIDIA-NeMo/RL) | A small patch ([integrations/nemo_rl](integrations/nemo_rl/README.md)) | The loss is tested against NeMo-RL's own code. The full loop is not yet run. |
+| [verl](https://github.com/verl-project/verl) | Import hooks, no change to verl ([below](#verl)) | The code of the paper's experiments. Hooks tested on CPU with stand-in classes; short Vanilla and STOPD runs on two A100s. |
+| [TRL](https://github.com/huggingface/trl) | `stopd.integrations.trl.STOPDTrainer` ([below](#trl)) | Real TRL 1.15.0: tests on CPU and on one GPU; training with vLLM colocate on an A100 and an RTX A6000. |
+| [NeMo-RL](https://github.com/NVIDIA-NeMo/RL) | A small patch ([integrations/nemo_rl](integrations/nemo_rl/README.md)) | The loss is tested against NeMo-RL's own code; the full loop, with a resume, on two RTX A6000s. |
 | OpenRLHF | Not yet supported: OpenRLHF 0.11 has no on-policy distillation. | — |
 
 Install with `pip install git+https://github.com/YouAreSpecialToMe/STOPD`, or `pip install "stopd[trl] @ git+https://github.com/YouAreSpecialToMe/STOPD"` to also install TRL.
@@ -155,7 +155,7 @@ src/sitecustomize.py               installs the verl hooks in every process
 src/stopd/integrations/trl.py      TRL's STOPDTrainer
 integrations/nemo_rl/              the NeMo-RL patch
 examples/                          verl data preparation and a Vanilla / STOPD run in mathematics
-tests/                             CPU tests
+tests/                             unit tests
 paper/                             the paper
 ```
 
@@ -173,10 +173,14 @@ The core tests need only PyTorch and run on CPU. They check that:
 
 Two integration suites run only when their framework is present:
 
-- The TRL tests run real TRL with tiny models on CPU when `trl` is installed. A plain PyTorch divergence stands in for TRL's Triton kernel.
+- The TRL tests run real TRL with tiny models when `trl` is installed: on the GPU when exactly one is visible, with TRL's Triton kernel, and otherwise on CPU, where a plain PyTorch divergence stands in for that kernel.
 - The NeMo-RL tests run when `NEMO_RL_SRC` points to a patched NeMo-RL checkout.
 
-Runs on GPUs inside the frameworks are not covered.
+The integrations were also run on GPUs:
+
+- verl, on two A100s: a 4-step Vanilla run, then STOPD from its step-2 checkpoint to step 6. The run checked the denominator chain and the largest weight.
+- TRL with vLLM colocate, on one A100 and on one RTX A6000: 5 steps. The run checked that every rollout stopped within its budget, the denominator chain and the saved state. `examples/trl_math.py` also ran for 4 steps.
+- NeMo-RL, on two RTX A6000s: 4 steps, then a resume from the step-4 checkpoint to step 6, with the same checks as TRL.
 
 ## Citation
 

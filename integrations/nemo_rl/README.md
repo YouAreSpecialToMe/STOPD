@@ -62,4 +62,4 @@ The loss raises an error at setup if any of these does not hold:
 NEMO_RL_SRC=/path/to/patched/RL python -m unittest discover -s tests -p test_nemo_rl_integration.py
 ```
 
-The full training loop (Ray, vLLM, GPUs) has not been run with the patch yet.
+The full loop has also run on two RTX A6000 GPUs with NeMo-RL `c989568` (vLLM 0.29.0, automodel policy). It distilled Qwen3-4B-Instruct-2507 into Qwen3-1.7B-Base in mathematics with L = 1,024, K = 64 and two warmup steps, ran to step 4, and resumed from the step-4 checkpoint to step 6. Every rollout stayed within its budget on both vLLM workers, each step's denominator was the previous step's estimate, and the resumed run continued from the checkpointed state.
