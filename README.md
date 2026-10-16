@@ -5,7 +5,7 @@ Code for the paper **Does On-Policy Distillation Need to Complete Every Rollout?
 Zhengxin Zhang\*, Maosen Tang\*, Ning Wang\*, Changhao Li\*, Jingren Zhou, Bo Dai, Sainyam Galhotra, Claire Cardie
 (\* equal contribution)
 
-[Paper (PDF)](paper/stopd.pdf) · arXiv link coming soon
+[arXiv](https://arxiv.org/abs/2610.21337)
 
 On-policy distillation (OPD) trains a student on its own rollouts with token-level feedback from a teacher, but generating complete rollouts and scoring every token is expensive. STOPD randomly truncates student rollouts and corrects the resulting sampling bias with blockwise inverse-probability weighting (IPW), which preserves Vanilla OPD's gradient sum in expectation. Across teacher–student pairs, task domains and optimizers, STOPD generates 25–48% fewer tokens with accuracy comparable to Vanilla OPD, for 1.3–2.2× faster training.
 
