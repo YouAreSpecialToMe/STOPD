@@ -2,7 +2,7 @@
 
 Code for the paper **Does On-Policy Distillation Need to Complete Every Rollout?**
 
-Zhengxin Zhang\*, Maosen Tang\*, Ning Wang\*, Changhao Li\*, Jingren Zhou, Bo Dai, Sainyam Galhotra, Claire Cardie
+Zhengxin Zhang\*, Maosen Tang\*, Ning Wang\*, Changhao Li\*, Jingren Zhou, Bo Dai, Sainyam Galhotra, Alex Townsend, Claire Cardie
 (\* equal contribution)
 
 [arXiv](https://arxiv.org/abs/2610.21337)
@@ -186,10 +186,13 @@ The integrations were also run on GPUs:
 
 ```bibtex
 @misc{zhang2026stopd,
-  title  = {Does On-Policy Distillation Need to Complete Every Rollout?},
-  author = {Zhang, Zhengxin and Tang, Maosen and Wang, Ning and Li, Changhao and Zhou, Jingren and Dai, Bo and Galhotra, Sainyam and Cardie, Claire},
-  year   = {2026},
-  note   = {arXiv link coming soon}
+  title         = {Does On-Policy Distillation Need to Complete Every Rollout?},
+  author        = {Zhang, Zhengxin and Tang, Maosen and Wang, Ning and Li, Changhao and Zhou, Jingren and Dai, Bo and Galhotra, Sainyam and Townsend, Alex and Cardie, Claire},
+  year          = {2026},
+  eprint        = {2610.21337},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2610.21337}
 }
 ```
 
